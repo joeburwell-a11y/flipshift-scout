@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+<title>FlipShift Scout — Daily eBay Intelligence</title>
+
+<!-- PWA Manifest -->
+<link rel="manifest" href="/manifest.json"/>
+
+<!-- iOS PWA Support -->
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="FS Scout"/>
+<link rel="apple-touch-icon" href="/icons/icon-180.png"/>
+<link rel="apple-touch-icon" sizes="192x192" href="/icons/icon-192.png"/>
+
+<!-- Theme color for browser chrome -->
+<meta name="theme-color" content="#f0a500"/>
+<meta name="description" content="Daily eBay market intelligence for resellers. Know what sells before you shop."/>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #070910;
+    font-family: 'Segoe UI', sans-serif;
+    color: #dde4f0;
+    /* iOS PWA: respect notch and home indicator */
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  ::-webkit-scrollbar { width: 6px; } 
+  ::-webkit-scrollbar-track { background: #0d1018; }
+  ::-webkit-scrollbar-thumb { background: #1a2133; border-radius: 3px; }
+  input[type=time]::-webkit-calendar-picker-indicator { filter: invert(0.5); }
+  a { text-decoration: none; }
+  @keyframes fspin { to { transform: rotate(360deg); } }
+  @keyframes fadein { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+  .card-anim { animation: fadein 0.25s ease; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const EMAIL_TO   = "Joeburwell@gmail.com";
+const LOG_PREFIX = "fss:log:";
+const API_URL    = "https://api.anthropic.com/v1/messages";
+
+const CATEGORIES = [
+  { id:"mens-shirts",   label:"Men's Shirts",   emoji:"👔" },
+  { id:"mens-jeans",    label:"Men's Jeans",     emoji:"🔵" },
+  { id:"womens-tops",   label:"Women's Tops",    emoji:"👚" },
+  { id:"womens-jeans",  label:"Women's Jeans",   emoji:"👖" },
+  { id:"jackets-coats", label:"Jackets & Coats", emoji:"🧥" },
+  { id:"sneakers",      label:"Sneakers",        emoji:"👟" },
+  { id:"hoodies",       label:"Hoodies",         emoji:"🦘" },
+  { id:"vintage",       label:"Vintage",         emoji:"🕰️" },
+  { id:"designer",      label:"Designer",        emoji:"💎" },
+  { id:"activewear",    label:"Activewear",      emoji:"🏃" },
+];
+const DEFAULT_CATS = ["mens-shirts","mens-jeans","womens-tops","jackets-coats","vintage"];
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+const C = {
+  bg:"#070910", surface:"#0d1018", card:"#121620", card2:"#161c28",
+  border:"#1a2133", accent:"#f0a500", accentLo:"#f0a50015", accentBrd:"#f0a50040",
+  green:"#22d47e", greenLo:"#22d47e15", red:"#f05050",
+  muted:"#3d4d63", text:"#dde4f0", textDim:"#7a8fa8",
+  mono:"'Consolas','Courier New',monospace",
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const todayKey = () => new Date().toISOString().slice(0,10);
+const fmtDate  = (iso) => {
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})
+       + " " + d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"});
+};
+
+// LocalStorage persistence (works offline, no external storage needed)
+const store = {
+  get: (key) => { try { const v=localStorage.getItem(key); return v?JSON.parse(v):null; } catch{return null;} },
+  set: (key,val) => { try { localStorage.setItem(key,JSON.stringify(val)); } catch{} },
+  keys: (prefix) => {
+    try {
+      const out=[];
+      for(let i=0;i<localStorage.length;i++){
+        const k=localStorage.key(i);
+        if(k&&k.startsWith(prefix)) out.push(k);
+      }
+      return out;
+    } catch { return []; }
+  },
+};
+
+// ── Gmail compose link builder ────────────────────────────────────────────────
+function buildGmailLink(items, summary) {
+  const dateStr = new Date().toLocaleDateString("en-US",{
+    weekday:"long",year:"numeric",month:"long",day:"numeric"
+  });
+  const lines = items.slice(0,12).map((it,i)=>{
+    const sold   = it.avgSoldPrice   ? "$"+it.avgSoldPrice.toFixed(2) : "--";
+    const buy    = it.thriftCost     ? "$"+it.thriftCost              : "--";
+    const str    = it.sellThroughRate!=null ? it.sellThroughRate+"%" : "--";
+    const sizes  = (it.sizes||[]).join(", ")||"--";
+    const colors = (it.colors||[]).slice(0,3).join(", ")||"--";
+    const days   = it.avgDaysToSell  ? " | "+it.avgDaysToSell+"d avg" : "";
+    const tip    = it.insight        ? "\n  Tip: "+it.insight         : "";
+    return "#"+(i+1)+" "+it.brand+" -- "+(it.category||"Clothing")+"\n"
+         + "  Sizes: "+sizes+" | Colors: "+colors+"\n"
+         + "  Avg Sold: "+sold+" | Buy up to: "+buy+" | STR: "+str+days+tip;
+  }).join("\n\n");
+
+  const body = [
+    "FLIPSHIFT SCOUT -- DAILY BUY REPORT",dateStr,
+    "----------------------------------------","",
+    "MARKET SNAPSHOT",
+    "Avg Sell-Through: "+(summary?.avgSTR||"--")+"%",
+    "Market: "+(summary?.hotMarket||"--"),
+    "Best Time to List: "+(summary?.bestTimeToSell||"--"),
+    "Tip: "+(summary?.tip||"--"),"",
+    "========================================",
+    "TOP SELLERS -- BUY THESE TODAY",
+    "========================================","",lines,"",
+    "----------------------------------------",
+    "Happy flipping, Joe!","-- FlipShift Scout",
+  ].join("\n");
+
+  return "https://mail.google.com/mail/?view=cm"
+       + "&to="  +encodeURIComponent(EMAIL_TO)
+       + "&su="  +encodeURIComponent("FlipShift Scout -- Daily Buy Report ("+dateStr+")")
+       + "&body="+encodeURIComponent(body);
+}
+
+// ── Fetch market data ─────────────────────────────────────────────────────────
+async function fetchMarketData(catLabels, customQ, apiKey) {
+  const query = customQ || catLabels.join(", ") || "used clothing eBay";
+  const resp = await fetch(API_URL, {
+    method:"POST",
+    headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body: JSON.stringify({
+      model:"claude-sonnet-4-20250514", max_tokens:2000,
+      tools:[{type:"web_search_20250305",name:"web_search"}],
+      messages:[{role:"user",content:
+        "You are an eBay reseller analyst for used clothing.\n\n"
+        +"Analyze eBay SOLD listings for best-performing used clothing in: "+query+".\n\n"
+        +"RULES: Output ONLY a raw JSON object. No markdown, no code fences, no preamble.\n"
+        +"Use ONLY plain ASCII in all strings. No smart quotes, em dashes, or special characters.\n"
+        +"Use plain hyphens not dashes. Keep all insight text simple plain English.\n\n"
+        +'Follow this exact JSON structure: {"summary":{"totalAnalyzed":200,"avgSTR":74,'
+        +'"hotMarket":"brief description","bestTimeToSell":"Thursday evenings",'
+        +'"tip":"one actionable tip"},"items":[{"brand":"Brand","category":"subcategory",'
+        +'"sizes":["S","M","L"],"colors":["Black","Navy"],"avgSoldPrice":28.00,'
+        +'"priceRange":"$18-$45","thriftCost":8,"sellThroughRate":78,"avgDaysToSell":6,'
+        +'"salesCount":47,"competition":"Low","insight":"plain text insight here"}]}\n\n'
+        +"Include 10 items. Realistic eBay sold prices. thriftCost = max buy for 40% margin after 13% fees."
+      }],
+    }),
+  });
+  if (!resp.ok) throw new Error("API "+resp.status);
+  const data = await resp.json();
+  const text = (data.content||[]).find(b=>b.type==="text")?.text||"";
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error("No JSON in response");
+  const clean = m[0]
+    .replace(/[\u2018\u2019]/g,"'").replace(/[\u201C\u201D]/g,'"')
+    .replace(/\u2013|\u2014/g,"-").replace(/\u2026/g,"...")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g," ")
+    .replace(/,(\s*[}\]])/g,"$1");
+  try { return JSON.parse(clean); }
+  catch(e) {
+    const sm=clean.match(/"summary"\s*:\s*\{[^}]*\}/);
+    const im=clean.match(/"items"\s*:\s*\[[\s\S]*\]/);
+    if(im) return JSON.parse("{"+(sm?sm[0]+",":"")+im[0]+"}");
+    throw new Error("Parse failed: "+e.message.slice(0,60));
+  }
+}
+
+// ── Fallback data ─────────────────────────────────────────────────────────────
+const FALLBACK = {
+  summary:{totalAnalyzed:185,avgSTR:79,hotMarket:"Strong demand in workwear and denim",
+    bestTimeToSell:"Thursday 7-9pm",tip:"Focus on Carhartt and Levi's -- highest velocity this week."},
+  items:[
+    {brand:"Levi's",category:"Men's Jeans",sizes:["32x30","34x32","36x32"],
+      colors:["Medium Wash","Dark Wash","Black"],avgSoldPrice:34.99,priceRange:"$22-$58",
+      thriftCost:8,sellThroughRate:82,avgDaysToSell:4,salesCount:156,competition:"Medium",
+      insight:"501s and 505s are sweet spots. Red tab only. Avoid stretch denim."},
+    {brand:"Carhartt",category:"Jackets",sizes:["M","L","XL","XXL"],
+      colors:["Brown","Black","Duck"],avgSoldPrice:52.00,priceRange:"$32-$85",
+      thriftCost:12,sellThroughRate:77,avgDaysToSell:5,salesCount:71,competition:"Low",
+      insight:"Detroit jackets command premium. Check liner for tears or stains."},
+    {brand:"Ralph Lauren",category:"Men's Shirts",sizes:["M","L","XL"],
+      colors:["White","Blue","Pink"],avgSoldPrice:28.50,priceRange:"$18-$45",
+      thriftCost:6,sellThroughRate:74,avgDaysToSell:7,salesCount:89,competition:"Low",
+      insight:"Polo and rugby shirts move fast. Check collar for fading."},
+    {brand:"Nike",category:"Activewear",sizes:["S","M","L","XL"],
+      colors:["Black","Grey","Navy"],avgSoldPrice:22.00,priceRange:"$14-$38",
+      thriftCost:5,sellThroughRate:89,avgDaysToSell:3,salesCount:203,competition:"High",
+      insight:"Tech Fleece highest velocity. Volume play - buy multiples."},
+    {brand:"Patagonia",category:"Fleece",sizes:["S","M","L","XL"],
+      colors:["Green","Navy","Black","Red"],avgSoldPrice:65.00,priceRange:"$45-$95",
+      thriftCost:15,sellThroughRate:85,avgDaysToSell:4,salesCount:42,competition:"Low",
+      insight:"Synchilla and Better Sweater fly off shelves. Logo condition matters."},
+    {brand:"Tommy Hilfiger",category:"Men's Shirts",sizes:["M","L","XL"],
+      colors:["Navy","Red","White"],avgSoldPrice:24.00,priceRange:"$14-$38",
+      thriftCost:5,sellThroughRate:68,avgDaysToSell:9,salesCount:54,competition:"Medium",
+      insight:"Stripe polos and sailing graphics are top sellers."},
+  ],
+};
+
+// ── UI Components ─────────────────────────────────────────────────────────────
+const Spin = ({size=15}) => (
+  <svg width={size} height={size} viewBox="0 0 16 16"
+    style={{animation:"fspin .8s linear infinite",display:"block",flexShrink:0}}>
+    <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeDasharray="24 10"/>
+  </svg>
+);
+
+const Tag = ({children,color=C.muted,onClick}) => (
+  <span onClick={onClick} style={{display:"inline-flex",alignItems:"center",gap:4,
+    fontSize:11,fontFamily:C.mono,padding:"3px 9px",borderRadius:6,
+    background:color+"18",border:"1px solid "+color+"44",color,
+    cursor:onClick?"pointer":"default",whiteSpace:"nowrap"}}>
+    {children}
+  </span>
+);
+
+const Pill = ({children}) => (
+  <span style={{display:"inline-flex",padding:"2px 8px",borderRadius:20,fontSize:11,
+    background:C.card2,color:C.textDim,border:"1px solid "+C.border,
+    marginRight:4,marginBottom:4}}>{children}</span>
+);
+
+const STRBar = ({value}) => {
+  const col = value>=70?C.green:value>=40?C.accent:C.red;
+  return (
+    <div>
+      <div style={{width:"100%",height:4,background:C.border,borderRadius:2,overflow:"hidden",marginTop:8}}>
+        <div style={{height:"100%",width:Math.min(value,100)+"%",background:col,
+          borderRadius:2,transition:"width .5s ease"}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:3,
+        fontSize:10,fontFamily:C.mono,color:C.textDim}}>
+        <span>Sell-through</span><span style={{color:col}}>{value}%</span>
+      </div>
+    </div>
+  );
+};
+
+const ResultCard = ({item,rank}) => {
+  const margin = item.avgSoldPrice&&item.thriftCost
+    ? Math.round(((item.avgSoldPrice-item.thriftCost-item.avgSoldPrice*0.13)/item.avgSoldPrice)*100):null;
+  return (
+    <div className="card-anim" style={{background:C.card,border:"1px solid "+C.border,
+      borderRadius:14,padding:"18px 20px",marginBottom:8,
+      display:"grid",gridTemplateColumns:"36px 1fr auto",gap:14,alignItems:"start"}}>
+      <div style={{width:36,height:36,borderRadius:8,background:C.accentLo,
+        border:"1px solid "+C.accentBrd,display:"flex",alignItems:"center",
+        justifyContent:"center",fontSize:13,fontWeight:700,color:C.accent,
+        fontFamily:C.mono,flexShrink:0}}>#{rank}</div>
+      <div>
+        <div style={{fontSize:16,fontWeight:700,color:C.text,marginBottom:4}}>{item.brand}</div>
+        <div style={{fontSize:12,color:C.textDim,marginBottom:8,display:"flex",flexWrap:"wrap",gap:"4px 12px"}}>
+          {item.category&&<span>{"📦 "+item.category}</span>}
+          {item.salesCount&&<span>{"🔥 "+item.salesCount+" sold"}</span>}
+          {item.avgDaysToSell!=null&&<span>{"⏱ "+item.avgDaysToSell+"d avg"}</span>}
+        </div>
+        {item.sizes?.length>0&&(
+          <div style={{marginBottom:6}}>
+            <span style={{fontSize:9,color:C.muted,fontFamily:C.mono,marginRight:6,letterSpacing:".1em"}}>SIZES</span>
+            {item.sizes.map(s=><Pill key={s}>{s}</Pill>)}
+          </div>
+        )}
+        {item.colors?.length>0&&(
+          <div style={{marginBottom:8}}>
+            <span style={{fontSize:9,color:C.muted,fontFamily:C.mono,marginRight:6,letterSpacing:".1em"}}>COLORS</span>
+            {item.colors.map(c=><Pill key={c}>{c}</Pill>)}
+          </div>
+        )}
+        <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+          {item.sellThroughRate!=null&&(
+            <Tag color={item.sellThroughRate>=70?C.green:item.sellThroughRate>=40?C.accent:C.red}>
+              {"⚡ STR "+item.sellThroughRate+"%"}
+            </Tag>)}
+          {item.competition&&<Tag color={C.muted}>{"📊 "+item.competition+" competition"}</Tag>}
+        </div>
+        {item.insight&&(
+          <div style={{marginTop:10,fontSize:12,color:C.textDim,lineHeight:1.5,fontStyle:"italic"}}>
+            {"💡 "+item.insight}
+          </div>)}
+      </div>
+      <div style={{textAlign:"right",minWidth:110,flexShrink:0}}>
+        <div style={{fontSize:10,color:C.muted,fontFamily:C.mono,marginBottom:4}}>AVG SOLD</div>
+        <div style={{fontSize:20,fontWeight:700,color:C.green,fontFamily:C.mono}}>
+          {item.avgSoldPrice?"$"+item.avgSoldPrice.toFixed(2):"--"}
+        </div>
+        {item.priceRange&&<div style={{fontSize:11,color:C.textDim}}>{item.priceRange}</div>}
+        {item.thriftCost!=null&&<div style={{fontSize:11,color:C.textDim}}>{"Buy \u2264 $"+item.thriftCost}</div>}
+        {margin!=null&&(
+          <div style={{display:"inline-block",marginTop:6,padding:"3px 8px",borderRadius:6,
+            fontSize:11,fontFamily:C.mono,fontWeight:600,
+            background:margin>0?C.greenLo:"#f0505018",color:margin>0?C.green:C.red,
+            border:"1px solid "+(margin>0?C.green:C.red)+"44"}}>
+            {(margin>0?"+":"")+margin+"% margin"}
+          </div>)}
+        {item.sellThroughRate!=null&&<STRBar value={item.sellThroughRate}/>}
+      </div>
+    </div>
+  );
+};
+
+const Terminal = ({logs}) => {
+  const ref=useRef(null);
+  useEffect(()=>{if(ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[logs]);
+  if(!logs.length) return null;
+  return (
+    <div ref={ref} style={{background:"#080b10",border:"1px solid "+C.border,borderRadius:12,
+      padding:"13px 15px",marginBottom:16,fontFamily:C.mono,fontSize:12,color:C.textDim,
+      minHeight:52,maxHeight:130,overflowY:"auto"}}>
+      {logs.map((l,i)=>(
+        <div key={i} style={{marginBottom:3,display:"flex",gap:8,
+          color:l.t==="ok"?C.green:l.t==="err"?C.red:l.t==="hi"?C.accent:C.textDim}}>
+          <span style={{color:C.muted,flexShrink:0}}>{"["+l.ts+"]"}</span>
+          <span>{l.msg}</span>
+        </div>))}
+    </div>
+  );
+};
+
+const LogRow = ({entry,onView}) => (
+  <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:12,
+    padding:"15px 18px",marginBottom:8,display:"flex",alignItems:"center",
+    justifyContent:"space-between",gap:14}}>
+    <div>
+      <div style={{fontSize:13,fontWeight:600,color:C.text}}>{fmtDate(entry.timestamp)}</div>
+      <div style={{fontSize:12,color:C.textDim,marginTop:3}}>
+        {(entry.items?.length||0)+" items  •  Avg STR "+(entry.summary?.avgSTR||"--")+"%"}
+      </div>
+    </div>
+    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+      {entry.gmailLink&&(
+        <a href={entry.gmailLink} target="_blank" rel="noreferrer"
+          style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 12px",
+            borderRadius:8,background:C.greenLo,color:C.green,
+            border:"1px solid "+C.green+"44",fontSize:12,fontWeight:600}}>
+          ✉ Resend
+        </a>)}
+      <button onClick={()=>onView(entry)} style={{padding:"6px 14px",borderRadius:8,
+        border:"1px solid "+C.border,background:C.card2,color:C.textDim,
+        fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>View →</button>
+    </div>
+  </div>
+);
+
+// ── API Key Setup Screen ───────────────────────────────────────────────────────
+const SetupScreen = ({onSave}) => {
+  const [key,setKey]=useState("");
+  const [show,setShow]=useState(false);
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",
+      alignItems:"center",justifyContent:"center",padding:24}}>
+      <div style={{maxWidth:480,width:"100%",background:C.card,
+        border:"1px solid "+C.border,borderRadius:20,padding:36}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:28}}>
+          <div style={{width:44,height:44,background:C.accent,borderRadius:10,
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:22}}>🔍</div>
+          <div>
+            <div style={{fontSize:20,fontWeight:700}}>FlipShift Scout</div>
+            <div style={{fontSize:12,color:C.textDim,fontFamily:C.mono}}>Desktop App Setup</div>
+          </div>
+        </div>
+
+        <div style={{fontSize:13,color:C.textDim,lineHeight:1.7,marginBottom:24}}>
+          Enter your Anthropic API key to enable live eBay market scanning.
+          Your key is saved locally on this device only — never sent anywhere except Anthropic's API.
+        </div>
+
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:10,fontFamily:C.mono,color:C.muted,
+            letterSpacing:".1em",textTransform:"uppercase",marginBottom:8}}>
+            Anthropic API Key
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <input
+              type={show?"text":"password"}
+              value={key}
+              onChange={e=>setKey(e.target.value)}
+              placeholder="sk-ant-..."
+              style={{flex:1,background:C.surface,border:"1px solid "+C.border,
+                borderRadius:8,padding:"11px 14px",color:C.text,fontSize:14,
+                fontFamily:C.mono,outline:"none"}}
+            />
+            <button onClick={()=>setShow(s=>!s)} style={{padding:"11px 14px",
+              borderRadius:8,border:"1px solid "+C.border,background:C.card2,
+              color:C.textDim,cursor:"pointer",fontSize:14}}>
+              {show?"🙈":"👁️"}
+            </button>
+          </div>
+        </div>
+
+        <div style={{fontSize:11,color:C.muted,marginBottom:24,lineHeight:1.6}}>
+          Get your key at{" "}
+          <a href="https://console.anthropic.com/settings/keys" target="_blank"
+            style={{color:C.accent}}>console.anthropic.com</a>
+          {" "}→ API Keys. Usage is pay-per-scan (a few cents per daily scan).
+        </div>
+
+        <button
+          onClick={()=>{ if(key.trim().startsWith("sk-ant-")||key.trim().startsWith("sk-")) onSave(key.trim()); }}
+          disabled={!key.trim()}
+          style={{width:"100%",padding:"13px",borderRadius:10,
+            background:key.trim()?C.accent:C.muted,
+            color:key.trim()?"#000":C.textDim,
+            fontWeight:700,fontSize:14,border:"none",cursor:key.trim()?"pointer":"not-allowed",
+            fontFamily:"inherit",transition:"all .15s"}}>
+          Save Key & Launch App →
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [apiKey,setApiKey]              = useState(()=>localStorage.getItem("fss:apikey")||"");
+  const [tab,setTab]                    = useState("scout");
+  const [selectedCats,setSelectedCats]  = useState(DEFAULT_CATS);
+  const [customQ,setCustomQ]            = useState("");
+  const [loading,setLoading]            = useState(false);
+  const [results,setResults]            = useState([]);
+  const [summary,setSummary]            = useState(null);
+  const [logs,setLogs]                  = useState([]);
+  const [lastRun,setLastRun]            = useState(null);
+  const [gmailLink,setGmailLink]        = useState(null);
+  const [autoEnabled,setAutoEnabled]    = useState(true);
+  const [scheduleTime,setScheduleTime]  = useState("07:00");
+  const [nextRun,setNextRun]            = useState(null);
+  const [history,setHistory]            = useState([]);
+  const [viewEntry,setViewEntry]        = useState(null);
+  const timerRef = useRef(null);
+
+  const saveApiKey = (key) => {
+    localStorage.setItem("fss:apikey",key);
+    setApiKey(key);
+  };
+
+  const addLog = useCallback((msg,t="info")=>{
+    const ts=new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+    setLogs(p=>[...p.slice(-20),{msg,t,ts}]);
+  },[]);
+
+  const loadHistory = useCallback(()=>{
+    const keys=store.keys(LOG_PREFIX);
+    const entries=keys.map(k=>store.get(k)).filter(Boolean);
+    entries.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+    setHistory(entries);
+  },[]);
+
+  const runScout = useCallback(async(isAuto=false)=>{
+    if(loading||!apiKey) return;
+    setLoading(true); setResults([]); setSummary(null); setGmailLink(null); setLogs([]);
+    const catLabels=selectedCats.map(id=>CATEGORIES.find(c=>c.id===id)?.label).filter(Boolean);
+    addLog((isAuto?"⏰ Auto-scan":"▶ Manual scan")+" started","hi");
+    addLog("Scanning: "+(catLabels.join(", ")||"All categories"),"info");
+
+    let items=[], sum=null;
+    try {
+      addLog("Fetching live eBay sold listing data...","info");
+      const data=await fetchMarketData(catLabels,customQ,apiKey);
+      items=data.items||[]; sum=data.summary||null;
+      addLog("Found "+items.length+" top performers","ok");
+      if(sum?.tip) addLog("Tip: "+sum.tip,"hi");
+    } catch(err) {
+      addLog("API error: "+err.message+" -- using cached data","err");
+      items=FALLBACK.items; sum=FALLBACK.summary;
+      addLog("Loaded "+items.length+" cached items","ok");
+    }
+
+    setResults(items); setSummary(sum);
+    const link=buildGmailLink(items,sum);
+    setGmailLink(link);
+    addLog("Gmail draft ready","ok");
+
+    const now=new Date();
+    const entry={date:todayKey(),timestamp:now.toISOString(),
+      items,summary:sum,categories:catLabels,gmailLink:link};
+    store.set(LOG_PREFIX+entry.date,entry);
+    setHistory(prev=>[entry,...prev.filter(e=>e.date!==entry.date)]
+      .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+    setLastRun(now.toLocaleString());
+    addLog("Saved to daily log","ok");
+    setLoading(false);
+  },[loading,apiKey,selectedCats,customQ,addLog]);
+
+  // Scheduler
+  useEffect(()=>{
+    clearTimeout(timerRef.current);
+    if(!autoEnabled){setNextRun(null);return;}
+    const [h,m]=scheduleTime.split(":").map(Number);
+    const next=new Date(); next.setHours(h,m,0,0);
+    if(next<=new Date()) next.setDate(next.getDate()+1);
+    setNextRun(next);
+    timerRef.current=setTimeout(()=>runScout(true),next-new Date());
+    return()=>clearTimeout(timerRef.current);
+  },[autoEnabled,scheduleTime]); // eslint-disable-line
+
+  // Init
+  useEffect(()=>{
+    loadHistory();
+    const todayEntry=store.get(LOG_PREFIX+todayKey());
+    if(todayEntry){
+      setResults(todayEntry.items||[]); setSummary(todayEntry.summary||null);
+      setGmailLink(todayEntry.gmailLink||null);
+      setLastRun(fmtDate(todayEntry.timestamp));
+      setLogs([{msg:"Today's scan loaded from log ("+fmtDate(todayEntry.timestamp)+")",t:"ok",
+        ts:new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}]);
+    } else if(apiKey) {
+      setTimeout(()=>runScout(true),600);
+    }
+  },[]); // eslint-disable-line
+
+  if(!apiKey) return <SetupScreen onSave={saveApiKey}/>;
+
+  const toggleCat=(id)=>setSelectedCats(p=>p.includes(id)?p.filter(c=>c!==id):[...p,id]);
+
+  // Style helpers
+  const tabBtn=(active)=>({padding:"7px 18px",borderRadius:8,fontSize:13,fontWeight:500,
+    cursor:"pointer",border:"none",background:active?C.accent:"transparent",
+    color:active?"#000":C.textDim,transition:"all .15s",fontFamily:"inherit"});
+  const primaryBtn=(disabled)=>({padding:"11px 22px",borderRadius:10,
+    background:disabled?C.muted:C.accent,color:disabled?C.textDim:"#000",
+    fontWeight:700,fontSize:13,border:"none",cursor:disabled?"not-allowed":"pointer",
+    display:"flex",alignItems:"center",gap:8,fontFamily:"inherit",
+    transition:"all .15s",whiteSpace:"nowrap"});
+  const emailBtnStyle={padding:"11px 20px",borderRadius:10,background:C.greenLo,color:C.green,
+    fontWeight:700,fontSize:13,border:"1px solid "+C.green+"55",
+    cursor:"pointer",display:"inline-flex",alignItems:"center",gap:8,
+    fontFamily:"inherit",whiteSpace:"nowrap"};
+  const cardStyle={background:C.card,border:"1px solid "+C.border,borderRadius:14,padding:"20px 22px",marginBottom:16};
+  const lbl={fontSize:10,fontFamily:C.mono,color:C.muted,letterSpacing:".1em",textTransform:"uppercase",marginBottom:6};
+  const inp={background:C.surface,border:"1px solid "+C.border,borderRadius:8,
+    padding:"10px 14px",color:C.text,fontSize:14,fontFamily:C.mono,
+    outline:"none",width:"100%",boxSizing:"border-box"};
+
+  return (
+    <div style={{background:C.bg,minHeight:"100vh",color:C.text,fontFamily:"'Segoe UI',sans-serif"}}>
+
+      {/* Header */}
+      <div style={{background:"linear-gradient(180deg,#0a0d14,#070910)",
+        borderBottom:"1px solid "+C.border,padding:"14px 24px",
+        display:"flex",alignItems:"center",justifyContent:"space-between",
+        position:"sticky",top:0,zIndex:50}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <div style={{width:32,height:32,background:C.accent,borderRadius:8,
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:17}}>🔍</div>
+          <span style={{fontSize:17,fontWeight:700,letterSpacing:"-.5px"}}>FlipShift Scout</span>
+          <span style={{fontSize:10,fontFamily:C.mono,color:C.accent,background:C.accentLo,
+            border:"1px solid "+C.accentBrd,borderRadius:4,padding:"2px 6px"}}>DESKTOP</span>
+          {autoEnabled&&<span style={{fontSize:10,fontFamily:C.mono,color:C.green,
+            background:C.greenLo,border:"1px solid "+C.green+"40",borderRadius:4,padding:"2px 6px"}}>⏰ AUTO</span>}
+        </div>
+        <div style={{display:"flex",gap:4,alignItems:"center"}}>
+          {[["scout","📡 Scout"],["scheduler","⏰ Scheduler"],["history","📋 Log"],["settings","⚙️"]].map(([id,lbl2])=>(
+            <button key={id} style={tabBtn(tab===id)} onClick={()=>setTab(id)}>{lbl2}</button>))}
+        </div>
+      </div>
+
+      <div style={{maxWidth:1100,margin:"0 auto",padding:"22px 20px"}}>
+
+        {/* ── SCOUT ── */}
+        {tab==="scout"&&(<>
+          <div style={{marginBottom:18}}>
+            <div style={lbl}>Categories</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(116px,1fr))",gap:7,marginBottom:14}}>
+              {CATEGORIES.map(c=>(
+                <button key={c.id} onClick={()=>toggleCat(c.id)} style={{
+                  padding:"9px 10px",borderRadius:10,
+                  border:"1px solid "+(selectedCats.includes(c.id)?C.accent:C.border),
+                  background:selectedCats.includes(c.id)?C.accentLo:C.card,
+                  color:selectedCats.includes(c.id)?C.accent:C.textDim,
+                  fontSize:12,fontWeight:500,cursor:"pointer",
+                  display:"flex",flexDirection:"column",alignItems:"flex-start",gap:4,
+                  transition:"all .15s",fontFamily:"inherit"}}>
+                  <span style={{fontSize:17}}>{c.emoji}</span>
+                  <span>{c.label}</span>
+                </button>))}
+            </div>
+          </div>
+
+          <div style={{marginBottom:14}}>
+            <div style={lbl}>Refine search (optional)</div>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+              <input style={{...inp,flex:1,minWidth:220}} value={customQ}
+                placeholder="e.g. vintage band tees, Carhartt jackets, Y2K denim..."
+                onChange={e=>setCustomQ(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&runScout(false)}/>
+              <button style={primaryBtn(loading)} onClick={()=>runScout(false)} disabled={loading}>
+                {loading?<Spin/>:"⚡"}{loading?"Scanning...":"Run Scout"}
+              </button>
+              {gmailLink&&!loading&&(
+                <a href={gmailLink} target="_blank" rel="noreferrer" style={emailBtnStyle}>
+                  ✉ Open Gmail Draft
+                </a>)}
+            </div>
+          </div>
+
+          <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}>
+            {lastRun&&<span style={{fontSize:11,color:C.muted,fontFamily:C.mono}}>Last: {lastRun}</span>}
+            {gmailLink&&!loading&&<Tag color={C.green}>✉ Gmail draft ready for {EMAIL_TO}</Tag>}
+          </div>
+
+          <Terminal logs={logs}/>
+
+          {summary&&(
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10,marginBottom:18}}>
+              {[["Avg Sell-Through",summary.avgSTR+"%",C.green,22],
+                ["Market",summary.hotMarket,C.text,13],
+                ["Best List Time",summary.bestTimeToSell,C.text,13],
+                ["Analyzed",summary.totalAnalyzed,C.text,22]
+              ].map(([l2,val,col,fs])=>(
+                <div key={l2} style={{background:C.card,border:"1px solid "+C.border,borderRadius:12,padding:"14px 16px"}}>
+                  <div style={lbl}>{l2}</div>
+                  <div style={{fontSize:fs,fontWeight:700,color:col,lineHeight:1.3}}>{val}</div>
+                </div>))}
+            </div>)}
+
+          {gmailLink&&!loading&&(
+            <div style={{background:C.greenLo,border:"1px solid "+C.green+"44",
+              borderRadius:12,padding:"14px 18px",marginBottom:16,
+              display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
+              <div>
+                <div style={{fontSize:13,fontWeight:600,color:C.green}}>✉ Daily report ready</div>
+                <div style={{fontSize:12,color:C.textDim,marginTop:3}}>Pre-filled Gmail draft to {EMAIL_TO}</div>
+              </div>
+              <a href={gmailLink} target="_blank" rel="noreferrer"
+                style={{...emailBtnStyle,fontSize:14,padding:"10px 22px"}}>
+                Open Gmail & Send →
+              </a>
+            </div>)}
+
+          {results.length>0?(
+            <div>
+              <div style={lbl}>{"🔥 Top Sellers — "+new Date().toLocaleDateString()}</div>
+              {results.map((item,i)=><ResultCard key={i} item={item} rank={i+1}/>)}
+            </div>
+          ):!loading&&(
+            <div style={{textAlign:"center",padding:"56px 24px",color:C.muted}}>
+              <div style={{fontSize:48,marginBottom:16,opacity:.25}}>📡</div>
+              <div style={{fontSize:15,fontWeight:600,color:C.textDim,marginBottom:6}}>Initializing daily scan...</div>
+              <div style={{fontSize:13}}>Auto-runs on launch if no scan found today</div>
+            </div>)}
+        </>)}
+
+        {/* ── SCHEDULER ── */}
+        {tab==="scheduler"&&(<>
+          <div style={cardStyle}>
+            <div style={lbl}>Auto-Scan Schedule</div>
+            <div style={{display:"flex",gap:24,flexWrap:"wrap",marginBottom:20}}>
+              <div>
+                <div style={{...lbl,marginBottom:8}}>Auto-scan</div>
+                <div style={{display:"flex",gap:8}}>
+                  {["On","Off"].map(opt=>(
+                    <button key={opt} onClick={()=>setAutoEnabled(opt==="On")} style={{
+                      padding:"8px 20px",borderRadius:8,fontSize:13,fontWeight:600,
+                      border:"1px solid "+((opt==="On")===autoEnabled?C.green:C.border),
+                      background:(opt==="On")===autoEnabled?C.greenLo:C.card2,
+                      color:(opt==="On")===autoEnabled?C.green:C.textDim,
+                      cursor:"pointer",fontFamily:"inherit"}}>{opt}</button>))}
+                </div>
+              </div>
+              <div>
+                <div style={{...lbl,marginBottom:8}}>Daily scan time</div>
+                <input type="time" value={scheduleTime} onChange={e=>setScheduleTime(e.target.value)}
+                  style={{...inp,width:"auto"}}/>
+              </div>
+            </div>
+            {autoEnabled&&nextRun&&(
+              <div style={{background:C.greenLo,border:"1px solid "+C.green+"40",
+                borderRadius:10,padding:"12px 16px",marginBottom:16}}>
+                <div style={{fontSize:12,color:C.green,fontFamily:C.mono}}>
+                  {"⏰ Next scan: "+nextRun.toLocaleString("en-US",{weekday:"short",month:"short",
+                    day:"numeric",hour:"2-digit",minute:"2-digit"})}
+                </div>
+                <div style={{fontSize:11,color:C.textDim,marginTop:4}}>
+                  Gmail draft opens automatically after scan
+                </div>
+              </div>)}
+            <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+              <button style={primaryBtn(loading)} onClick={()=>runScout(false)} disabled={loading}>
+                {loading?<Spin/>:"▶"} {loading?"Running...":"Run Now"}
+              </button>
+              {gmailLink&&<a href={gmailLink} target="_blank" rel="noreferrer" style={emailBtnStyle}>✉ Open Gmail Draft</a>}
+            </div>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={lbl}>How It Works</div>
+            {[["📡","Scans on launch","Opens and auto-scans eBay if no scan today. Keep app open for daily scheduling."],
+              ["🧠","AI + Web Search","Analyzes eBay sold/completed listings with live Anthropic web search."],
+              ["💾","Saved locally","Each scan is saved to your browser's localStorage — persists between launches."],
+              ["✉️","One-click email","Generates a pre-filled Gmail draft. Click to open and send to "+EMAIL_TO+"."],
+            ].map(([icon,title,desc])=>(
+              <div key={title} style={{display:"flex",gap:14,marginBottom:14,alignItems:"flex-start"}}>
+                <div style={{fontSize:22,flexShrink:0}}>{icon}</div>
+                <div>
+                  <div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:3}}>{title}</div>
+                  <div style={{fontSize:12,color:C.textDim,lineHeight:1.5}}>{desc}</div>
+                </div>
+              </div>))}
+          </div>
+        </>)}
+
+        {/* ── HISTORY ── */}
+        {tab==="history"&&!viewEntry&&(<>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+            <div style={lbl}>{"Scan Log ("+history.length+" scans)"}</div>
+            <button onClick={loadHistory} style={{padding:"6px 14px",borderRadius:8,
+              border:"1px solid "+C.border,background:C.card2,color:C.textDim,
+              fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>↻ Refresh</button>
+          </div>
+          {history.length===0?(
+            <div style={{textAlign:"center",padding:"48px",color:C.muted}}>
+              <div style={{fontSize:36,opacity:.3,marginBottom:12}}>📋</div>
+              <div style={{fontSize:14,color:C.textDim}}>No history yet — run a scout first</div>
+            </div>
+          ):history.map((e,i)=><LogRow key={i} entry={e} onView={setViewEntry}/>)}
+        </>)}
+
+        {tab==="history"&&viewEntry&&(<>
+          <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:18,flexWrap:"wrap"}}>
+            <button onClick={()=>setViewEntry(null)} style={{padding:"7px 16px",borderRadius:8,
+              border:"1px solid "+C.border,background:C.card,color:C.textDim,
+              fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>← Back</button>
+            <div>
+              <div style={{fontSize:14,fontWeight:600,color:C.text}}>{fmtDate(viewEntry.timestamp)}</div>
+              <div style={{fontSize:12,color:C.textDim}}>{(viewEntry.items?.length||0)+" items"}</div>
+            </div>
+            {viewEntry.gmailLink&&(
+              <a href={viewEntry.gmailLink} target="_blank" rel="noreferrer"
+                style={{...emailBtnStyle,marginLeft:"auto"}}>✉ Resend Draft</a>)}
+          </div>
+          {(viewEntry.items||[]).map((item,i)=><ResultCard key={i} item={item} rank={i+1}/>)}
+        </>)}
+
+        {/* ── SETTINGS ── */}
+        {tab==="settings"&&(
+          <div style={cardStyle}>
+            <div style={lbl}>API Key</div>
+            <div style={{fontSize:13,color:C.textDim,marginBottom:12}}>
+              Update your Anthropic API key. Stored locally on this device only.
+            </div>
+            <div style={{display:"flex",gap:10,marginBottom:16}}>
+              <input type="password" defaultValue={apiKey}
+                id="apiKeyInput"
+                placeholder="sk-ant-..."
+                style={{...inp,flex:1,fontFamily:C.mono}}/>
+              <button onClick={()=>{
+                const v=document.getElementById("apiKeyInput").value.trim();
+                if(v){saveApiKey(v);alert("API key saved!");}
+              }} style={{...primaryBtn(false),whiteSpace:"nowrap"}}>
+                Save Key
+              </button>
+            </div>
+            <div style={{fontSize:12,color:C.muted,lineHeight:1.7}}>
+              Get your key at{" "}
+              <a href="https://console.anthropic.com/settings/keys" target="_blank"
+                style={{color:C.accent}}>console.anthropic.com</a>
+              {" → API Keys. Each daily scan costs a few cents."}
+            </div>
+            <div style={{marginTop:20,paddingTop:20,borderTop:"1px solid "+C.border}}>
+              <div style={lbl}>Email Destination</div>
+              <div style={{background:C.surface,border:"1px solid "+C.accentBrd,
+                borderRadius:10,padding:"12px 16px",fontFamily:C.mono,fontSize:15,color:C.accent}}>
+                {EMAIL_TO}
+              </div>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<App/>, document.getElementById("root"));
+</script>
+
+<!-- Service Worker Registration -->
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js")
+      .then((reg) => console.log("[FSS] SW registered:", reg.scope))
+      .catch((err) => console.warn("[FSS] SW registration failed:", err));
+  });
+}
+
+// iOS PWA: detect if running as installed app
+if (window.navigator.standalone === true) {
+  console.log("[FSS] Running as iOS PWA");
+  document.documentElement.style.setProperty("--safe-bottom", "env(safe-area-inset-bottom)");
+}
+</script>
+</body>
+</html>
